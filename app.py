@@ -272,10 +272,15 @@ with st.sidebar:
     else:
         cmp_start, cmp_end = _auto_prev_start, _auto_prev_end
 
-    countries = sorted(df_all["country"].unique().tolist())
-    medias = sorted(df_all["media"].unique().tolist())
-    items = sorted(df_all["item"].unique().tolist())
-    objectives = sorted([o for o in df_all["objective"].unique() if o and o != "nan"])
+    def _unique_str(col: str) -> list[str]:
+        s = df_all[col].dropna().astype(str).str.strip()
+        s = s[(s != "") & (s.str.lower() != "nan")]
+        return sorted(s.unique().tolist())
+
+    countries = _unique_str("country")
+    medias = _unique_str("media")
+    items = _unique_str("item")
+    objectives = _unique_str("objective")
 
     sel_countries = st.multiselect("국가", countries, default=countries)
     sel_medias = st.multiselect("매체", medias, default=medias)
