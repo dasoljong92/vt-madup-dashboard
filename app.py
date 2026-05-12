@@ -8,11 +8,12 @@ from __future__ import annotations
 import calendar
 import datetime
 import io
-import urllib.request
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+import requests
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -93,15 +94,35 @@ def _parse_num(x) -> float:
         return 0.0
 
 
+def _fetch_csv_bytes(url: str, attempts: int = 3) -> bytes:
+    """Stream the Sheets export with generous timeouts and retries."""
+    last_err = None
+    for i in range(attempts):
+        try:
+            with requests.get(url, timeout=(15, 300), stream=True) as r:
+                r.raise_for_status()
+                buf = io.BytesIO()
+                for chunk in r.iter_content(chunk_size=256 * 1024):
+                    if chunk:
+                        buf.write(chunk)
+                return buf.getvalue()
+        except (requests.RequestException, OSError) as e:
+            last_err = e
+            time.sleep(2 ** i)
+    raise RuntimeError(f"Google Sheets CSV 다운로드 실패: {last_err}")
+
+
 @st.cache_data(show_spinner=False)
 def load_data(refresh_key: int = 0) -> pd.DataFrame:
     """Load and clean the RD sheet. refresh_key forces cache invalidation."""
     if LOCAL_CSV.exists() and refresh_key == 0:
         raw = LOCAL_CSV.read_bytes()
     else:
-        with urllib.request.urlopen(CSV_URL, timeout=60) as r:
-            raw = r.read()
-        LOCAL_CSV.write_bytes(raw)
+        raw = _fetch_csv_bytes(CSV_URL)
+        try:
+            LOCAL_CSV.write_bytes(raw)
+        except OSError:
+            pass  # read-only FS는 무시
 
     df = pd.read_csv(io.BytesIO(raw), header=2, low_memory=False)
 
