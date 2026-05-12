@@ -698,7 +698,7 @@ def _top_creatives(
     sort_col: str,
     fx_rate: float,
     n: int = 10,
-    item2_filter: list | None = None,
+    item_filter: list | None = None,
 ) -> pd.DataFrame:
     m = (
         (df_src["일별"].dt.date >= d_start)
@@ -708,12 +708,12 @@ def _top_creatives(
         & (df_src["objective"] == objective)
     )
     sub = df_src[m]
-    if item2_filter is not None and len(item2_filter) > 0:
-        sub = sub[sub["품목2"].isin(item2_filter)]
+    if item_filter is not None and len(item_filter) > 0:
+        sub = sub[sub["item"].isin(item_filter)]
     if sub.empty:
         return sub
     g = sub.groupby("광고 이름", dropna=False).agg(
-        item2=("품목2", lambda s: s.dropna().iloc[0] if s.dropna().size else ""),
+        item=("item", lambda s: s.dropna().iloc[0] if s.dropna().size else ""),
         link=("소재 링크", lambda s: s.dropna().iloc[0] if s.dropna().size else ""),
         cost=("cost", "sum"),
         impressions=("impressions", "sum"),
@@ -730,21 +730,28 @@ def _top_creatives(
     return g
 
 
+_TOP_RENAME = {
+    "item": "품목",
+    "link": "소재 링크",
+    "cost": "지출(NET)",
+    "impressions": "노출수",
+    "clicks": "클릭수",
+    "ctr": "CTR(%)",
+    "sales_usd": "AA Sales(USD)",
+    "roas": "ROAS",
+}
+_TOP_COLS = ["순위", "품목", "광고 이름", "소재 링크", "지출(NET)", "노출수", "클릭수", "CTR(%)", "AA Sales(USD)", "ROAS"]
+
+
+def _format_top(df_top: pd.DataFrame) -> pd.DataFrame:
+    return df_top.rename(columns=_TOP_RENAME)[_TOP_COLS]
+
+
 def _render_top(df_top: pd.DataFrame):
     if df_top.empty:
         st.info("조건에 해당하는 소재가 없습니다.")
         return
-    show = df_top.rename(columns={
-        "광고 이름": "광고 이름",
-        "item2": "품목2",
-        "link": "소재 링크",
-        "cost": "지출(NET)",
-        "impressions": "노출수",
-        "clicks": "클릭수",
-        "ctr": "CTR(%)",
-        "sales_usd": "AA Sales(USD)",
-        "roas": "ROAS",
-    })[["순위", "품목2", "광고 이름", "소재 링크", "지출(NET)", "노출수", "클릭수", "CTR(%)", "AA Sales(USD)", "ROAS"]]
+    show = _format_top(df_top)
     st.dataframe(
         show.style.format({
             "지출(NET)": "₩{:,.0f}",
@@ -764,31 +771,79 @@ def _render_top(df_top: pd.DataFrame):
     )
 
 
+def _build_top10_xlsx(df_all_, d_start_, d_end_, fx_rate_, items_to_include: list) -> bytes:
+    """품목별 CTR Top 10 + AA Sales Top 10 을 한 엑셀에 시트로 묶어 반환."""
+    out = io.BytesIO()
+    ctr_chunks, sales_chunks = [], []
+    for it in items_to_include:
+        ctr = _top_creatives(
+            df_all_, d_start_, d_end_,
+            country="US", media="TikTok", objective="Traffic",
+            min_cost=100_000, sort_col="ctr", fx_rate=fx_rate_,
+            item_filter=[it],
+        )
+        if not ctr.empty:
+            ctr_chunks.append(_format_top(ctr))
+        sales = _top_creatives(
+            df_all_, d_start_, d_end_,
+            country="US", media="Meta", objective="Traffic",
+            min_cost=100_000, sort_col="sales_usd", fx_rate=fx_rate_,
+            item_filter=[it],
+        )
+        if not sales.empty:
+            sales_chunks.append(_format_top(sales))
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        if ctr_chunks:
+            pd.concat(ctr_chunks, ignore_index=True).to_excel(
+                writer, sheet_name="CTR Top10 (TikTok)", index=False)
+        else:
+            pd.DataFrame([{"안내": "조건에 맞는 소재 없음"}]).to_excel(
+                writer, sheet_name="CTR Top10 (TikTok)", index=False)
+        if sales_chunks:
+            pd.concat(sales_chunks, ignore_index=True).to_excel(
+                writer, sheet_name="Sales Top10 (Meta)", index=False)
+        else:
+            pd.DataFrame([{"안내": "조건에 맞는 소재 없음"}]).to_excel(
+                writer, sheet_name="Sales Top10 (Meta)", index=False)
+    out.seek(0)
+    return out.getvalue()
+
+
 # === Tab 6: Top Creatives ===
 with tab6:
-    st.markdown("### 🏆 우수 소재 Top 10 (품목2 기준)")
+    st.markdown("### 🏆 우수 소재 Top 10 (품목 기준)")
     st.caption(
         "사이드바의 기간 필터만 적용되며, 그 외 조건은 아래에 고정됩니다. "
         "각 소재는 '광고 이름' 단위로 집계 · 지출 NET 10만원 이상만 포함."
     )
 
-    # 품목2 필터 옵션: US × Traffic × (TikTok|Meta) 조합에서 발생한 품목2만 노출
+    # 품목 필터 옵션: US × Traffic × (TikTok|Meta) 조합에서 발생한 품목만 노출
     _src_mask = (
         (df_all["country"] == "US")
         & (df_all["objective"] == "Traffic")
         & (df_all["media"].isin(["TikTok", "Meta"]))
     )
-    item2_options = sorted(df_all.loc[_src_mask, "품목2"].dropna().astype(str).unique().tolist())
+    item_options = sorted(df_all.loc[_src_mask, "item"].dropna().astype(str).unique().tolist())
 
-    sel_item2 = st.multiselect(
-        "🧴 품목2 필터",
-        options=item2_options,
-        default=item2_options,
-        help="선택한 품목2에 해당하는 소재만 두 Top 10 표에 표시됩니다. 비우면 전체.",
-        placeholder="모든 품목2",
+    sel_item = st.multiselect(
+        "🧴 품목 필터",
+        options=item_options,
+        default=item_options,
+        help="선택한 품목에 해당하는 소재만 두 Top 10 표에 표시됩니다. 비우면 전체.",
+        placeholder="모든 품목",
     )
-    if not sel_item2:
-        sel_item2 = item2_options
+    if not sel_item:
+        sel_item = item_options
+
+    # 품목별 일괄 엑셀 다운로드
+    xlsx_bytes = _build_top10_xlsx(df_all, d_start, d_end, fx_rate, sel_item)
+    st.download_button(
+        "⬇️ 품목별 Top 10 한 번에 엑셀로 다운로드 (xlsx)",
+        data=xlsx_bytes,
+        file_name=f"top10_by_item_{d_start}_{d_end}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="시트 2개: 'CTR Top10 (TikTok)' / 'Sales Top10 (Meta)'. 선택된 품목별로 각 10개씩 포함.",
+    )
 
     col_a, col_b = st.columns(2)
 
@@ -799,7 +854,7 @@ with tab6:
             df_all, d_start, d_end,
             country="US", media="TikTok", objective="Traffic",
             min_cost=100_000, sort_col="ctr", fx_rate=fx_rate,
-            item2_filter=sel_item2,
+            item_filter=sel_item,
         )
         _render_top(top_ctr)
 
@@ -810,7 +865,7 @@ with tab6:
             df_all, d_start, d_end,
             country="US", media="Meta", objective="Traffic",
             min_cost=100_000, sort_col="sales_usd", fx_rate=fx_rate,
-            item2_filter=sel_item2,
+            item_filter=sel_item,
         )
         _render_top(top_sales)
 
