@@ -1,0 +1,22 @@
+# Local data cache (앱 첫 실행 시 Google Sheets에서 다시 받음)
+rd_data.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local config
+.claude/

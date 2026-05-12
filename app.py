@@ -1,0 +1,797 @@
+"""
+VT x MADUP US/UK 광고 성과 대시보드
+- 데이터 소스: Google Sheets ("2026 RD" 시트)
+- 메인 지표: CTR, ROAS, 지출 금액
+"""
+from __future__ import annotations
+
+import calendar
+import datetime
+import io
+import urllib.request
+from datetime import date, timedelta
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+import streamlit.components.v1 as components
+
+SHEET_ID = "1mFrK6lm-NZCd6_uHGeEzPYwywXXc1XfBIURbbmLXuLc"
+SHEET_GID = "1759920788"
+CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={SHEET_GID}"
+LOCAL_CSV = Path(__file__).parent / "rd_data.csv"
+
+# ---------- Page ----------
+st.set_page_config(
+    page_title="VT × MADUP 광고 성과 대시보드",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1400px;}
+    [data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #e6e8eb;
+        border-radius: 12px;
+        padding: 16px 18px;
+        box-shadow: 0 1px 2px rgba(15,23,42,0.04);
+    }
+    [data-testid="stMetricLabel"] p { font-size: 0.85rem; color:#64748b; font-weight:500;}
+    [data-testid="stMetricValue"] { font-size: 1.8rem; font-weight: 700; color:#0f172a;}
+    h1 { font-size: 1.7rem !important; font-weight: 700 !important; color:#0f172a;}
+    h2 { font-size: 1.2rem !important; font-weight: 600 !important; color:#1e293b; margin-top: 1.2rem !important;}
+    h3 { font-size: 1.05rem !important; font-weight: 600 !important; color:#334155;}
+    .stTabs [data-baseweb="tab-list"] { gap: 4px; }
+    .stTabs [data-baseweb="tab"] {
+        background: #f1f5f9;
+        border-radius: 8px 8px 0 0;
+        padding: 8px 18px;
+        font-weight: 500;
+    }
+    .stTabs [aria-selected="true"] { background: #0ea5e9; color: white; }
+    .caption-muted { color: #64748b; font-size: 0.85rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------- Cleanup any prior floating clock (after a hot reload) ----------
+components.html(
+    """
+<script>
+try {
+  const P = window.parent.document;
+  const old = P.getElementById('madup-clocks');
+  if (old) old.remove();
+  if (window.parent.__madupClockTimer) {
+    clearInterval(window.parent.__madupClockTimer);
+    window.parent.__madupClockTimer = null;
+  }
+} catch (e) {}
+</script>
+    """,
+    height=0,
+)
+
+
+# ---------- Data ----------
+def _parse_num(x) -> float:
+    if pd.isna(x):
+        return 0.0
+    s = str(x).replace("₩", "").replace(",", "").replace(" ", "").strip()
+    if s in {"", "-", "#REF!", "#VALUE!", "#DIV/0!"}:
+        return 0.0
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+@st.cache_data(show_spinner=False)
+def load_data(refresh_key: int = 0) -> pd.DataFrame:
+    """Load and clean the RD sheet. refresh_key forces cache invalidation."""
+    if LOCAL_CSV.exists() and refresh_key == 0:
+        raw = LOCAL_CSV.read_bytes()
+    else:
+        with urllib.request.urlopen(CSV_URL, timeout=60) as r:
+            raw = r.read()
+        LOCAL_CSV.write_bytes(raw)
+
+    df = pd.read_csv(io.BytesIO(raw), header=2, low_memory=False)
+
+    # Keep only rows with valid date and country
+    df["일별"] = pd.to_datetime(df["일별"], errors="coerce")
+    df = df.dropna(subset=["일별"]).copy()
+    df = df[df["국가"].notna()]
+
+    # Numeric conversions (cost = NET, "비용" 컬럼)
+    df["cost"] = df["비용"].apply(_parse_num)
+    df["cost_gross"] = df["지출 금액(GROSS)"].apply(_parse_num)
+    df["impressions"] = df["노출수"].apply(_parse_num)
+    df["clicks"] = df["클릭수(목적지)"].apply(_parse_num)
+    df["aa_sales_usd"] = pd.to_numeric(df["AA Total Sales"], errors="coerce").fillna(0)
+    df["ga4_revenue_usd"] = pd.to_numeric(df["GA4 총 구매 수익(USD)"], errors="coerce").fillna(0)
+    df["ga4_purchases"] = pd.to_numeric(df["GA4 구매"], errors="coerce").fillna(0)
+    df["aa_purchases"] = pd.to_numeric(df["AA purchase"], errors="coerce").fillna(0)
+
+    df["country"] = df["국가"].astype(str).str.strip()
+    df["media"] = df["매체"].astype(str).str.strip()
+    df["item"] = df["품목"].astype(str).str.strip()
+    df["objective"] = df["캠페인구분"].astype(str).str.strip()
+    df["campaign"] = df["캠페인 이름"].astype(str).str.strip()
+
+    return df
+
+
+def kpi(df: pd.DataFrame, fx_rate: float) -> dict:
+    cost = df["cost"].sum()
+    imp = df["impressions"].sum()
+    clk = df["clicks"].sum()
+    sales_usd = df["aa_sales_usd"].sum()
+    sales_krw = sales_usd * fx_rate
+    purchases = df["aa_purchases"].sum() + df["ga4_purchases"].sum()
+    return {
+        "cost_krw": cost,
+        "impressions": imp,
+        "clicks": clk,
+        "ctr": (clk / imp * 100) if imp > 0 else 0,
+        "sales_usd": sales_usd,
+        "sales_krw": sales_krw,
+        "roas": (sales_krw / cost) if cost > 0 else 0,
+        "cpc": (cost / clk) if clk > 0 else 0,
+        "cpm": (cost / imp * 1000) if imp > 0 else 0,
+        "purchases": purchases,
+    }
+
+
+def agg_by(df: pd.DataFrame, group_cols, fx_rate: float) -> pd.DataFrame:
+    g = df.groupby(group_cols, dropna=False).agg(
+        cost=("cost", "sum"),
+        impressions=("impressions", "sum"),
+        clicks=("clicks", "sum"),
+        sales_usd=("aa_sales_usd", "sum"),
+        purchases=("aa_purchases", "sum"),
+    ).reset_index()
+    g["sales_krw"] = g["sales_usd"] * fx_rate
+    g["ctr"] = (g["clicks"] / g["impressions"]).fillna(0) * 100
+    g["roas"] = (g["sales_krw"] / g["cost"]).fillna(0)
+    g["cpc"] = (g["cost"] / g["clicks"]).replace([float("inf")], 0).fillna(0)
+    g["cpm"] = (g["cost"] / g["impressions"] * 1000).replace([float("inf")], 0).fillna(0)
+    g.loc[g["impressions"] == 0, "ctr"] = 0
+    g.loc[g["cost"] == 0, "roas"] = 0
+    return g
+
+
+def fmt_krw(v: float) -> str:
+    return f"₩{v:,.0f}"
+
+
+def fmt_pct(v: float) -> str:
+    return f"{v:.2f}%"
+
+
+def fmt_num(v: float) -> str:
+    return f"{v:,.0f}"
+
+
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.markdown("### ⚙️ 설정")
+
+    if "refresh_key" not in st.session_state:
+        st.session_state.refresh_key = 0
+
+    if st.button("🔄 시트에서 최신 데이터 새로고침", width="stretch"):
+        st.session_state.refresh_key += 1
+        load_data.clear()
+        st.rerun()
+
+    fx_rate = st.number_input(
+        "환율 (1 USD → KRW)",
+        min_value=500.0,
+        max_value=3000.0,
+        value=1470.0,
+        step=10.0,
+        help="AA Total Sales는 USD 단위입니다. ROAS는 (USD 매출 × 환율) / NET 지출로 계산.",
+    )
+
+with st.spinner("데이터를 불러오는 중..."):
+    df_all = load_data(refresh_key=st.session_state.get("refresh_key", 0))
+
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("### 🔍 필터")
+
+    date_min = df_all["일별"].min().date()
+    date_max = df_all["일별"].max().date()
+
+    # 기본값: 이번 달 (데이터 가용 범위 내에서)
+    _today = datetime.date.today()
+    _m_start = _today.replace(day=1)
+    _last_day = calendar.monthrange(_today.year, _today.month)[1]
+    _m_end = _today.replace(day=_last_day)
+    _def_start = max(_m_start, date_min)
+    _def_end = min(_m_end, date_max)
+    if _def_start > _def_end:  # 이번 달에 데이터 없으면 가용 마지막 달로 폴백
+        _def_end = date_max
+        _def_start = max(date_max.replace(day=1), date_min)
+
+    date_range = st.date_input(
+        "기간 (기본: 이번 달)",
+        value=(_def_start, _def_end),
+        min_value=date_min,
+        max_value=date_max,
+    )
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        d_start, d_end = date_range
+    else:
+        d_start, d_end = date_min, date_max
+
+    # 비교 기간 (기본: 직전 동일 길이 구간, 사용자 수정 가능)
+    _auto_days = (d_end - d_start).days + 1
+    _auto_prev_end = d_start - timedelta(days=1)
+    _auto_prev_start = _auto_prev_end - timedelta(days=_auto_days - 1)
+    _auto_prev_start = max(_auto_prev_start, date_min)
+    _auto_prev_end = max(_auto_prev_end, _auto_prev_start)
+    cmp_range = st.date_input(
+        "비교 기간 (기본: 직전 동일 길이)",
+        value=(_auto_prev_start, _auto_prev_end),
+        min_value=date_min,
+        max_value=date_max,
+        help="KPI 카드 아래 '+/-% vs 직전' 계산에 사용됩니다.",
+    )
+    if isinstance(cmp_range, (list, tuple)) and len(cmp_range) == 2:
+        cmp_start, cmp_end = cmp_range
+    else:
+        cmp_start, cmp_end = _auto_prev_start, _auto_prev_end
+
+    countries = sorted(df_all["country"].unique().tolist())
+    medias = sorted(df_all["media"].unique().tolist())
+    items = sorted(df_all["item"].unique().tolist())
+    objectives = sorted([o for o in df_all["objective"].unique() if o and o != "nan"])
+
+    sel_countries = st.multiselect("국가", countries, default=countries)
+    sel_medias = st.multiselect("매체", medias, default=medias)
+    sel_items = st.multiselect("품목", items, default=items)
+    sel_obj = st.multiselect("캠페인 목적", objectives, default=objectives)
+
+# Apply filters
+mask = (
+    (df_all["일별"].dt.date >= d_start)
+    & (df_all["일별"].dt.date <= d_end)
+    & (df_all["country"].isin(sel_countries))
+    & (df_all["media"].isin(sel_medias))
+    & (df_all["item"].isin(sel_items))
+    & (df_all["objective"].isin(sel_obj))
+)
+df = df_all[mask].copy()
+
+
+# 비교 기간 (사이드바에서 사용자 지정)
+_prev_start, _prev_end = cmp_start, cmp_end
+_prev_mask = (
+    (df_all["일별"].dt.date >= _prev_start)
+    & (df_all["일별"].dt.date <= _prev_end)
+    & (df_all["country"].isin(sel_countries))
+    & (df_all["media"].isin(sel_medias))
+    & (df_all["item"].isin(sel_items))
+    & (df_all["objective"].isin(sel_obj))
+)
+df_prev = df_all[_prev_mask].copy()
+
+
+def _pct_delta(cur, prev) -> str | None:
+    if prev is None or pd.isna(prev) or prev == 0:
+        return None
+    return f"{(cur - prev) / prev * 100:+.1f}% vs 직전"
+
+
+# ---------- Header ----------
+components.html(
+    """
+<div id="madup-clocks-inline" style="
+  display:inline-flex; gap:14px; align-items:center;
+  background:rgba(15,23,42,0.92); color:#f8fafc;
+  padding:8px 14px; border-radius:10px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:12.5px; font-weight:500; letter-spacing:0.2px;
+  box-shadow:0 4px 12px rgba(15,23,42,0.18);
+"></div>
+<script>
+(function () {
+  function block(flag, label, tz) {
+    const opts = {timeZone: tz, hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false};
+    const t = new Date().toLocaleTimeString('en-GB', opts);
+    const d = new Date().toLocaleDateString('en-CA', {timeZone: tz});
+    return '<span style="display:flex;flex-direction:column;line-height:1.15;">'
+      + '<span style="opacity:.7;font-size:10.5px;">' + flag + ' ' + label + '</span>'
+      + '<span>' + t + '</span>'
+      + '<span style="opacity:.45;font-size:9.5px;">' + d + '</span>'
+      + '</span>';
+  }
+  function divider() {
+    return '<span style="width:1px;height:30px;background:rgba(255,255,255,0.18);"></span>';
+  }
+  function update() {
+    const el = document.getElementById('madup-clocks-inline');
+    if (!el) return;
+    el.innerHTML = block('🇰🇷','KST','Asia/Seoul')
+      + divider()
+      + block('🇺🇸','PT (LA)','America/Los_Angeles');
+  }
+  update();
+  setInterval(update, 1000);
+})();
+</script>
+    """,
+    height=64,
+)
+
+st.markdown("# 📊 VT × MADUP 광고 성과 대시보드")
+st.markdown(
+    f"<div class='caption-muted'>기간: <b>{d_start}</b> ~ <b>{d_end}</b>  ·  "
+    f"비교 기간: <b>{_prev_start}</b> ~ <b>{_prev_end}</b>  ·  "
+    f"국가 {len(sel_countries)}개 · 매체 {len(sel_medias)}개 · 품목 {len(sel_items)}개  ·  "
+    f"적용 환율: 1 USD = ₩{fx_rate:,.0f}</div>",
+    unsafe_allow_html=True,
+)
+st.markdown("")
+
+if df.empty:
+    st.warning("선택한 조건에 해당하는 데이터가 없습니다. 필터를 조정해 주세요.")
+    st.stop()
+
+
+# ---------- KPI ----------
+k = kpi(df, fx_rate)
+k_prev = kpi(df_prev, fx_rate)
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("💸 지출 금액 (NET)", fmt_krw(k["cost_krw"]),
+          _pct_delta(k["cost_krw"], k_prev["cost_krw"]))
+c2.metric("🛒 매출 (USD)", f"${k['sales_usd']:,.0f}",
+          _pct_delta(k["sales_usd"], k_prev["sales_usd"]),
+          help=f"≈ {fmt_krw(k['sales_krw'])}")
+c3.metric("📈 ROAS", f"{k['roas']:.2f}",
+          _pct_delta(k["roas"], k_prev["roas"]),
+          help="매출(KRW 환산) / NET 지출(KRW)")
+c4.metric("🎯 CTR", fmt_pct(k["ctr"]),
+          _pct_delta(k["ctr"], k_prev["ctr"]))
+c5.metric("👀 노출수", f"{k['impressions']/1e6:.2f}M",
+          _pct_delta(k["impressions"], k_prev["impressions"]))
+
+c6, c7, c8, c9 = st.columns(4)
+c6.metric("🖱️ 클릭수", fmt_num(k["clicks"]),
+          _pct_delta(k["clicks"], k_prev["clicks"]))
+c7.metric("CPC", fmt_krw(k["cpc"]),
+          _pct_delta(k["cpc"], k_prev["cpc"]),
+          delta_color="inverse")
+c8.metric("CPM", fmt_krw(k["cpm"]),
+          _pct_delta(k["cpm"], k_prev["cpm"]),
+          delta_color="inverse")
+c9.metric("🛍️ 총 구매 건수", fmt_num(k["purchases"]),
+          _pct_delta(k["purchases"], k_prev["purchases"]))
+
+
+# ---------- Tabs ----------
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["🌏 국가별", "📡 매체별", "📦 품목별", "📅 추세", "🧾 상세 데이터", "🏆 우수 소재"]
+)
+
+# === Tab 1: Country ===
+with tab1:
+    country = agg_by(df, ["country"], fx_rate).sort_values("cost", ascending=False)
+
+    st.markdown("### 국가별 핵심 성과")
+    cc1, cc2 = st.columns([2, 3])
+
+    with cc1:
+        fig_pie = px.pie(
+            country, names="country", values="cost", hole=0.55,
+            title="지출 비중 (국가별)",
+            color_discrete_sequence=px.colors.qualitative.Set2,
+        )
+        fig_pie.update_traces(textinfo="percent+label")
+        fig_pie.update_layout(height=380, margin=dict(t=50, b=10, l=10, r=10), showlegend=False)
+        st.plotly_chart(fig_pie, width="stretch")
+
+    with cc2:
+        fig_bar = go.Figure()
+        fig_bar.add_trace(go.Bar(
+            x=country["country"], y=country["ctr"], name="CTR (%)",
+            marker_color="#0ea5e9", yaxis="y",
+            text=[f"{v:.2f}%" for v in country["ctr"]], textposition="outside",
+        ))
+        fig_bar.add_trace(go.Scatter(
+            x=country["country"], y=country["roas"], name="ROAS",
+            mode="lines+markers+text", marker=dict(size=10, color="#f97316"),
+            line=dict(color="#f97316", width=3), yaxis="y2",
+            text=[f"{v:.2f}" for v in country["roas"]], textposition="top center",
+        ))
+        fig_bar.update_layout(
+            title="국가별 CTR & ROAS",
+            height=380,
+            margin=dict(t=50, b=10, l=10, r=10),
+            yaxis=dict(title="CTR (%)", side="left"),
+            yaxis2=dict(title="ROAS", side="right", overlaying="y"),
+            legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
+        )
+        st.plotly_chart(fig_bar, width="stretch")
+
+    st.markdown("### 국가별 상세")
+    show = country.rename(columns={
+        "country": "국가", "cost": "지출(NET)", "impressions": "노출수",
+        "clicks": "클릭수", "ctr": "CTR(%)", "sales_usd": "매출(USD)",
+        "sales_krw": "매출(KRW환산)", "roas": "ROAS", "cpc": "CPC", "cpm": "CPM",
+        "purchases": "구매",
+    })
+    st.dataframe(
+        show.style.format({
+            "지출(NET)": "₩{:,.0f}", "노출수": "{:,.0f}", "클릭수": "{:,.0f}",
+            "CTR(%)": "{:.2f}%", "매출(USD)": "${:,.2f}",
+            "매출(KRW환산)": "₩{:,.0f}", "ROAS": "{:.2f}",
+            "CPC": "₩{:,.0f}", "CPM": "₩{:,.0f}", "구매": "{:,.0f}",
+        }),
+        width="stretch", hide_index=True,
+    )
+
+    st.markdown("### 국가 × 매체 매트릭스")
+    pivot = agg_by(df, ["country", "media"], fx_rate)
+    if not pivot.empty:
+        cm1, cm2 = st.columns(2)
+        with cm1:
+            heat_ctr = pivot.pivot_table(index="country", columns="media", values="ctr", aggfunc="sum").fillna(0)
+            fig_h1 = px.imshow(heat_ctr, text_auto=".2f", aspect="auto",
+                              color_continuous_scale="Blues", title="CTR(%) — 국가 × 매체")
+            fig_h1.update_layout(height=320, margin=dict(t=50, b=10, l=10, r=10))
+            st.plotly_chart(fig_h1, width="stretch")
+        with cm2:
+            heat_roas = pivot.pivot_table(index="country", columns="media", values="roas", aggfunc="sum").fillna(0)
+            fig_h2 = px.imshow(heat_roas, text_auto=".2f", aspect="auto",
+                              color_continuous_scale="Oranges", title="ROAS — 국가 × 매체")
+            fig_h2.update_layout(height=320, margin=dict(t=50, b=10, l=10, r=10))
+            st.plotly_chart(fig_h2, width="stretch")
+
+
+# === Tab 2: Media ===
+with tab2:
+    media = agg_by(df, ["media"], fx_rate).sort_values("cost", ascending=False)
+
+    st.markdown("### 매체별 핵심 성과")
+    mm1, mm2, mm3 = st.columns(3)
+    mm1.metric("최다 지출", media.iloc[0]["media"], fmt_krw(media.iloc[0]["cost"]))
+    best_ctr = media.sort_values("ctr", ascending=False).iloc[0]
+    mm2.metric("최고 CTR", best_ctr["media"], fmt_pct(best_ctr["ctr"]))
+    best_roas = media.sort_values("roas", ascending=False).iloc[0]
+    mm3.metric("최고 ROAS", best_roas["media"], f"{best_roas['roas']:.2f}")
+
+    m1, m2 = st.columns(2)
+    with m1:
+        fig = px.bar(
+            media, x="media", y="cost",
+            title="매체별 지출", text_auto=".2s",
+            color="media", color_discrete_sequence=px.colors.qualitative.Pastel,
+        )
+        fig.update_layout(height=350, showlegend=False, margin=dict(t=50, b=10, l=10, r=10))
+        st.plotly_chart(fig, width="stretch")
+    with m2:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=media["media"], y=media["ctr"], name="CTR(%)",
+                              marker_color="#0ea5e9",
+                              text=[f"{v:.2f}%" for v in media["ctr"]], textposition="outside"))
+        fig.add_trace(go.Scatter(x=media["media"], y=media["roas"], name="ROAS",
+                                  mode="lines+markers", marker=dict(size=12, color="#f97316"),
+                                  line=dict(color="#f97316", width=3), yaxis="y2"))
+        fig.update_layout(
+            title="매체별 CTR & ROAS", height=350,
+            yaxis=dict(title="CTR(%)"),
+            yaxis2=dict(title="ROAS", side="right", overlaying="y"),
+            margin=dict(t=50, b=10, l=10, r=10),
+            legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+    st.markdown("### 매체 × 국가 지출 분포")
+    media_country = agg_by(df, ["media", "country"], fx_rate)
+    fig = px.bar(
+        media_country, x="media", y="cost", color="country",
+        text_auto=".2s", barmode="stack",
+        color_discrete_sequence=px.colors.qualitative.Set2,
+    )
+    fig.update_layout(height=380, margin=dict(t=30, b=10, l=10, r=10))
+    st.plotly_chart(fig, width="stretch")
+
+    st.markdown("### 매체별 상세")
+    show = media.rename(columns={
+        "media": "매체", "cost": "지출(NET)", "impressions": "노출수",
+        "clicks": "클릭수", "ctr": "CTR(%)", "sales_usd": "매출(USD)",
+        "sales_krw": "매출(KRW환산)", "roas": "ROAS", "cpc": "CPC", "cpm": "CPM",
+        "purchases": "구매",
+    })
+    st.dataframe(
+        show.style.format({
+            "지출(NET)": "₩{:,.0f}", "노출수": "{:,.0f}", "클릭수": "{:,.0f}",
+            "CTR(%)": "{:.2f}%", "매출(USD)": "${:,.2f}",
+            "매출(KRW환산)": "₩{:,.0f}", "ROAS": "{:.2f}",
+            "CPC": "₩{:,.0f}", "CPM": "₩{:,.0f}", "구매": "{:,.0f}",
+        }),
+        width="stretch", hide_index=True,
+    )
+
+
+# === Tab 3: Item ===
+with tab3:
+    item = agg_by(df, ["item"], fx_rate).sort_values("cost", ascending=False)
+
+    st.markdown("### 품목별 핵심 성과")
+    i1, i2 = st.columns(2)
+    with i1:
+        fig = px.bar(
+            item, x="item", y="cost", text_auto=".2s",
+            title="품목별 지출",
+            color="cost", color_continuous_scale="Blues",
+        )
+        fig.update_layout(height=380, margin=dict(t=50, b=10, l=10, r=10), coloraxis_showscale=False)
+        st.plotly_chart(fig, width="stretch")
+    with i2:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=item["item"], y=item["ctr"], name="CTR(%)",
+                              marker_color="#0ea5e9",
+                              text=[f"{v:.2f}%" for v in item["ctr"]], textposition="outside"))
+        fig.add_trace(go.Scatter(x=item["item"], y=item["roas"], name="ROAS",
+                                  mode="lines+markers", marker=dict(size=10, color="#f97316"),
+                                  line=dict(color="#f97316", width=3), yaxis="y2"))
+        fig.update_layout(
+            title="품목별 CTR & ROAS", height=380,
+            yaxis=dict(title="CTR(%)"),
+            yaxis2=dict(title="ROAS", side="right", overlaying="y"),
+            margin=dict(t=50, b=10, l=10, r=10),
+            legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+    st.markdown("### 품목 × 국가 성과")
+    ic = agg_by(df, ["item", "country"], fx_rate)
+    ic1, ic2 = st.columns(2)
+    with ic1:
+        heat = ic.pivot_table(index="item", columns="country", values="cost", aggfunc="sum").fillna(0)
+        fig = px.imshow(heat, text_auto=".2s", aspect="auto",
+                       color_continuous_scale="Blues", title="지출(KRW) — 품목 × 국가")
+        fig.update_layout(height=380, margin=dict(t=50, b=10, l=10, r=10))
+        st.plotly_chart(fig, width="stretch")
+    with ic2:
+        heat = ic.pivot_table(index="item", columns="country", values="roas", aggfunc="sum").fillna(0)
+        fig = px.imshow(heat, text_auto=".2f", aspect="auto",
+                       color_continuous_scale="Oranges", title="ROAS — 품목 × 국가")
+        fig.update_layout(height=380, margin=dict(t=50, b=10, l=10, r=10))
+        st.plotly_chart(fig, width="stretch")
+
+    st.markdown("### 품목별 상세")
+    show = item.rename(columns={
+        "item": "품목", "cost": "지출(NET)", "impressions": "노출수",
+        "clicks": "클릭수", "ctr": "CTR(%)", "sales_usd": "매출(USD)",
+        "sales_krw": "매출(KRW환산)", "roas": "ROAS", "cpc": "CPC", "cpm": "CPM",
+        "purchases": "구매",
+    })
+    st.dataframe(
+        show.style.format({
+            "지출(NET)": "₩{:,.0f}", "노출수": "{:,.0f}", "클릭수": "{:,.0f}",
+            "CTR(%)": "{:.2f}%", "매출(USD)": "${:,.2f}",
+            "매출(KRW환산)": "₩{:,.0f}", "ROAS": "{:.2f}",
+            "CPC": "₩{:,.0f}", "CPM": "₩{:,.0f}", "구매": "{:,.0f}",
+        }),
+        width="stretch", hide_index=True,
+    )
+
+
+# === Tab 4: Trend ===
+with tab4:
+    daily = agg_by(df, ["일별"], fx_rate).sort_values("일별")
+    daily["일별"] = pd.to_datetime(daily["일별"])
+
+    st.markdown("### 일자별 추세")
+    t1, t2 = st.columns(2)
+    with t1:
+        fig = px.area(daily, x="일별", y="cost", title="일자별 지출(KRW)",
+                     color_discrete_sequence=["#0ea5e9"])
+        fig.update_layout(height=320, margin=dict(t=50, b=10, l=10, r=10))
+        st.plotly_chart(fig, width="stretch")
+    with t2:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=daily["일별"], y=daily["ctr"], name="CTR(%)",
+                                  mode="lines", line=dict(color="#0ea5e9", width=2.5)))
+        fig.add_trace(go.Scatter(x=daily["일별"], y=daily["roas"], name="ROAS",
+                                  mode="lines", line=dict(color="#f97316", width=2.5), yaxis="y2"))
+        fig.update_layout(
+            title="일자별 CTR & ROAS", height=320,
+            yaxis=dict(title="CTR(%)"),
+            yaxis2=dict(title="ROAS", side="right", overlaying="y"),
+            margin=dict(t=50, b=10, l=10, r=10),
+            legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+    st.markdown("### 국가별 일자 추세 (지출)")
+    daily_country = agg_by(df, ["일별", "country"], fx_rate).sort_values("일별")
+    daily_country["일별"] = pd.to_datetime(daily_country["일별"])
+    fig = px.line(daily_country, x="일별", y="cost", color="country",
+                 color_discrete_sequence=px.colors.qualitative.Set2)
+    fig.update_layout(height=380, margin=dict(t=30, b=10, l=10, r=10),
+                      yaxis_title="지출(NET)", xaxis_title="")
+    st.plotly_chart(fig, width="stretch")
+
+    st.markdown("### 매체별 일자 추세 (CTR)")
+    daily_media = agg_by(df, ["일별", "media"], fx_rate).sort_values("일별")
+    daily_media["일별"] = pd.to_datetime(daily_media["일별"])
+    fig = px.line(daily_media, x="일별", y="ctr", color="media",
+                 color_discrete_sequence=px.colors.qualitative.Pastel)
+    fig.update_layout(height=380, margin=dict(t=30, b=10, l=10, r=10),
+                      yaxis_title="CTR(%)", xaxis_title="")
+    st.plotly_chart(fig, width="stretch")
+
+
+# === Tab 5: Raw ===
+with tab5:
+    st.markdown("### 캠페인 단위 상세 데이터")
+    camp = agg_by(df, ["country", "media", "item", "campaign"], fx_rate).sort_values("cost", ascending=False)
+    show = camp.rename(columns={
+        "country": "국가", "media": "매체", "item": "품목", "campaign": "캠페인",
+        "cost": "지출(NET)", "impressions": "노출수", "clicks": "클릭수",
+        "ctr": "CTR(%)", "sales_usd": "매출(USD)", "sales_krw": "매출(KRW환산)",
+        "roas": "ROAS", "cpc": "CPC", "cpm": "CPM", "purchases": "구매",
+    })
+    st.dataframe(
+        show.style.format({
+            "지출(NET)": "₩{:,.0f}", "노출수": "{:,.0f}", "클릭수": "{:,.0f}",
+            "CTR(%)": "{:.2f}%", "매출(USD)": "${:,.2f}",
+            "매출(KRW환산)": "₩{:,.0f}", "ROAS": "{:.2f}",
+            "CPC": "₩{:,.0f}", "CPM": "₩{:,.0f}", "구매": "{:,.0f}",
+        }),
+        width="stretch", hide_index=True, height=600,
+    )
+
+    csv_bytes = show.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "⬇️ CSV 다운로드 (필터 적용된 캠페인 단위)",
+        csv_bytes, file_name="campaign_performance.csv", mime="text/csv",
+    )
+
+
+# ---------- 우수 소재 (Top 10) helper functions ----------
+def _top_creatives(
+    df_src: pd.DataFrame,
+    d_start, d_end,
+    country: str, media: str, objective: str,
+    min_cost: float,
+    sort_col: str,
+    fx_rate: float,
+    n: int = 10,
+    item2_filter: list | None = None,
+) -> pd.DataFrame:
+    m = (
+        (df_src["일별"].dt.date >= d_start)
+        & (df_src["일별"].dt.date <= d_end)
+        & (df_src["country"] == country)
+        & (df_src["media"] == media)
+        & (df_src["objective"] == objective)
+    )
+    sub = df_src[m]
+    if item2_filter is not None and len(item2_filter) > 0:
+        sub = sub[sub["품목2"].isin(item2_filter)]
+    if sub.empty:
+        return sub
+    g = sub.groupby("광고 이름", dropna=False).agg(
+        item2=("품목2", lambda s: s.dropna().iloc[0] if s.dropna().size else ""),
+        link=("소재 링크", lambda s: s.dropna().iloc[0] if s.dropna().size else ""),
+        cost=("cost", "sum"),
+        impressions=("impressions", "sum"),
+        clicks=("clicks", "sum"),
+        sales_usd=("aa_sales_usd", "sum"),
+    ).reset_index()
+    g = g[g["cost"] >= min_cost].copy()
+    g["ctr"] = (g["clicks"] / g["impressions"]).replace([float("inf")], 0).fillna(0) * 100
+    g.loc[g["impressions"] == 0, "ctr"] = 0
+    g["roas"] = (g["sales_usd"] * fx_rate / g["cost"]).replace([float("inf")], 0).fillna(0)
+    g.loc[g["cost"] == 0, "roas"] = 0
+    g = g.sort_values(sort_col, ascending=False).head(n)
+    g.insert(0, "순위", range(1, len(g) + 1))
+    return g
+
+
+def _render_top(df_top: pd.DataFrame):
+    if df_top.empty:
+        st.info("조건에 해당하는 소재가 없습니다.")
+        return
+    show = df_top.rename(columns={
+        "광고 이름": "광고 이름",
+        "item2": "품목2",
+        "link": "소재 링크",
+        "cost": "지출(NET)",
+        "impressions": "노출수",
+        "clicks": "클릭수",
+        "ctr": "CTR(%)",
+        "sales_usd": "AA Sales(USD)",
+        "roas": "ROAS",
+    })[["순위", "품목2", "광고 이름", "소재 링크", "지출(NET)", "노출수", "클릭수", "CTR(%)", "AA Sales(USD)", "ROAS"]]
+    st.dataframe(
+        show.style.format({
+            "지출(NET)": "₩{:,.0f}",
+            "노출수": "{:,.0f}",
+            "클릭수": "{:,.0f}",
+            "CTR(%)": "{:.2f}%",
+            "AA Sales(USD)": "${:,.2f}",
+            "ROAS": "{:.2f}",
+        }),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "소재 링크": st.column_config.LinkColumn("소재 링크", display_text="🔗 열기"),
+            "광고 이름": st.column_config.TextColumn("광고 이름", width="large"),
+        },
+        height=420,
+    )
+
+
+# === Tab 6: Top Creatives ===
+with tab6:
+    st.markdown("### 🏆 우수 소재 Top 10 (품목2 기준)")
+    st.caption(
+        "사이드바의 기간 필터만 적용되며, 그 외 조건은 아래에 고정됩니다. "
+        "각 소재는 '광고 이름' 단위로 집계 · 지출 NET 10만원 이상만 포함."
+    )
+
+    # 품목2 필터 옵션: US × Traffic × (TikTok|Meta) 조합에서 발생한 품목2만 노출
+    _src_mask = (
+        (df_all["country"] == "US")
+        & (df_all["objective"] == "Traffic")
+        & (df_all["media"].isin(["TikTok", "Meta"]))
+    )
+    item2_options = sorted(df_all.loc[_src_mask, "품목2"].dropna().astype(str).unique().tolist())
+
+    sel_item2 = st.multiselect(
+        "🧴 품목2 필터",
+        options=item2_options,
+        default=item2_options,
+        help="선택한 품목2에 해당하는 소재만 두 Top 10 표에 표시됩니다. 비우면 전체.",
+        placeholder="모든 품목2",
+    )
+    if not sel_item2:
+        sel_item2 = item2_options
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.markdown("#### 🎯 CTR Top 10")
+        st.caption("**조건**: 국가 = US · 매체 = TikTok · 캠페인 = Traffic · 지출(NET) ≥ ₩100,000")
+        top_ctr = _top_creatives(
+            df_all, d_start, d_end,
+            country="US", media="TikTok", objective="Traffic",
+            min_cost=100_000, sort_col="ctr", fx_rate=fx_rate,
+            item2_filter=sel_item2,
+        )
+        _render_top(top_ctr)
+
+    with col_b:
+        st.markdown("#### 💰 AA Total Sales Top 10")
+        st.caption("**조건**: 국가 = US · 매체 = Meta · 캠페인 = Traffic · 지출(NET) ≥ ₩100,000")
+        top_sales = _top_creatives(
+            df_all, d_start, d_end,
+            country="US", media="Meta", objective="Traffic",
+            min_cost=100_000, sort_col="sales_usd", fx_rate=fx_rate,
+            item2_filter=sel_item2,
+        )
+        _render_top(top_sales)
+
+
+st.markdown("---")
+st.caption(
+    f"데이터 행수: {len(df):,} / 전체 {len(df_all):,}  ·  "
+    f"마지막 업데이트: {df_all['일별'].max().date()}  ·  "
+    "지출은 KRW (NET, '비용' 컬럼 기준), 매출은 AA Total Sales(USD)를 환율로 환산. ROAS·CPC·CPM 모두 NET 기준"
+)
