@@ -712,13 +712,18 @@ def _top_creatives(
         sub = sub[sub["item"].isin(item_filter)]
     if sub.empty:
         return sub
+    _first_str = lambda s: s.dropna().astype(str).iloc[0] if s.dropna().size else ""
     g = sub.groupby("광고 이름", dropna=False).agg(
-        item=("item", lambda s: s.dropna().iloc[0] if s.dropna().size else ""),
-        link=("소재 링크", lambda s: s.dropna().iloc[0] if s.dropna().size else ""),
+        item=("item", _first_str),
+        media_=("media", _first_str),
+        ad_code=("광고 코드", _first_str),
+        aa_link=("AA Attribution tags", _first_str),
+        link=("소재 링크", _first_str),
         cost=("cost", "sum"),
         impressions=("impressions", "sum"),
         clicks=("clicks", "sum"),
         sales_usd=("aa_sales_usd", "sum"),
+        purchases=("aa_purchases", "sum"),
     ).reset_index()
     g = g[g["cost"] >= min_cost].copy()
     g["ctr"] = (g["clicks"] / g["impressions"]).replace([float("inf")], 0).fillna(0) * 100
@@ -771,40 +776,166 @@ def _render_top(df_top: pd.DataFrame):
     )
 
 
+_XLSX_COLS = [
+    ("순위", 6, None),
+    ("광고 이름", 60, "@"),
+    ("제품", 24, "@"),
+    ("매체", 10, "@"),
+    ("광고 코드", 50, "@"),
+    ("AA 링크", 60, "@"),
+    ("지출 금액 (₩)", 16, '₩#,##0'),
+    ("노출", 12, '#,##0'),
+    ("클릭", 10, '#,##0'),
+    ("CTR", 9, '0.00%'),
+    ("AA Total Sales ($)", 22, '$#,##0.00'),
+    ("AA 구매", 10, '0'),
+    ("ROAS", 10, '0.00%'),
+]
+
+
 def _build_top10_xlsx(df_all_, d_start_, d_end_, fx_rate_, items_to_include: list) -> bytes:
-    """품목별 CTR Top 10 + AA Sales Top 10 을 한 엑셀에 시트로 묶어 반환."""
-    out = io.BytesIO()
-    ctr_chunks, sales_chunks = [], []
+    """우수 소재 Top 10 (CTR + Sales) 을 품목별로 묶어 보고서 형태 xlsx로 반환."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    HEADER_FILL = PatternFill("solid", fgColor="305496")
+    HEADER_FONT = Font(color="FFFFFF", bold=True)
+    CENTER = Alignment(horizontal="center", vertical="center")
+    LINK_FONT = Font(color="0563C1", underline="single")
+    TITLE_FONT = Font(bold=True, size=12)
+    SUB_FONT = Font(bold=True, size=10, color="595959")
+    GROUP_FONT = Font(bold=True, size=12)
+    SECTION_FONT = Font(bold=True, size=10, color="595959")
+    BORDER = Border(*(Side(style="thin", color="D9D9D9"),) * 4)
+
+    # 기준 모집단(필터)
+    base_mask = (
+        (df_all_["일별"].dt.date >= d_start_)
+        & (df_all_["일별"].dt.date <= d_end_)
+        & (df_all_["country"] == "US")
+        & (df_all_["objective"] == "Traffic")
+    )
+    base = df_all_[base_mask]
+    raw_total = len(df_all_)
+    pass_total = len(base)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "우수 소재 분석"
+
+    # 컬럼 너비
+    for i, (_, w, _) in enumerate(_XLSX_COLS, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # 메타데이터
+    ws.cell(row=1, column=1,
+            value=f"품목별 상위 소재 (필터: US · Traffic · 지출 ≥ ₩100,000) — 기간 {d_start_} ~ {d_end_}").font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value=f"소스 '2026 RD' raw {raw_total:,}행 → US·Traffic 통과 {pass_total:,}행 → (광고 이름) 단위 집계, 환율 1 USD = ₩{fx_rate_:,.0f}").font = SUB_FONT
+    ws.cell(row=3, column=1,
+            value="① CTR Top 10 ← 매체 TikTok    ② AA Total Sales ($) Top 10 ← 매체 Meta").font = SUB_FONT
+
+    cur_row = 5
+
+    def write_header(row: int):
+        for i, (name, _, _) in enumerate(_XLSX_COLS, start=1):
+            c = ws.cell(row=row, column=i, value=name)
+            c.fill = HEADER_FILL
+            c.font = HEADER_FONT
+            c.alignment = CENTER
+            c.border = BORDER
+
+    def write_data_row(row: int, rank: int, rec: dict):
+        ctr_ratio = (rec["clicks"] / rec["impressions"]) if rec["impressions"] else 0
+        roas_ratio = ((rec["sales_usd"] * fx_rate_) / rec["cost"]) if rec["cost"] else 0
+        values = [
+            rank,
+            rec["광고 이름"],
+            rec["item"],
+            rec["media_"],
+            rec["ad_code"],
+            rec["aa_link"],
+            float(rec["cost"]),
+            int(rec["impressions"]),
+            int(rec["clicks"]),
+            ctr_ratio,
+            float(rec["sales_usd"]),
+            int(rec["purchases"]),
+            roas_ratio,
+        ]
+        for i, (v, (_, _, nf)) in enumerate(zip(values, _XLSX_COLS), start=1):
+            c = ws.cell(row=row, column=i, value=v)
+            if nf:
+                c.number_format = nf
+            c.border = BORDER
+            if i == 1:
+                c.alignment = CENTER
+            if i == 6 and v:  # AA 링크
+                c.hyperlink = v
+                c.font = LINK_FONT
+
     for it in items_to_include:
-        ctr = _top_creatives(
+        # 통과 카운트
+        tt_count = int(
+            (base[(base["media"] == "TikTok") & (base["item"] == it)]
+             .groupby("광고 이름")["cost"].sum() >= 100_000).sum()
+        )
+        meta_count = int(
+            (base[(base["media"] == "Meta") & (base["item"] == it)]
+             .groupby("광고 이름")["cost"].sum() >= 100_000).sum()
+        )
+
+        # 품목 헤더
+        cell = ws.cell(row=cur_row, column=1,
+                       value=f"■ {it}  (지출 ≥ ₩100,000 통과: TikTok {tt_count}개, Meta {meta_count}개)")
+        cell.font = GROUP_FONT
+        cur_row += 1
+
+        # ① CTR Top 10 — TikTok
+        ws.cell(row=cur_row, column=1, value="① CTR Top 10 — TikTok").font = SECTION_FONT
+        cur_row += 1
+        write_header(cur_row)
+        cur_row += 1
+        ctr_df = _top_creatives(
             df_all_, d_start_, d_end_,
             country="US", media="TikTok", objective="Traffic",
             min_cost=100_000, sort_col="ctr", fx_rate=fx_rate_,
             item_filter=[it],
         )
-        if not ctr.empty:
-            ctr_chunks.append(_format_top(ctr))
-        sales = _top_creatives(
+        if ctr_df.empty:
+            ws.cell(row=cur_row, column=1, value="(해당 소재 없음)").font = SUB_FONT
+            cur_row += 1
+        else:
+            for i, rec in enumerate(ctr_df.to_dict("records"), start=1):
+                write_data_row(cur_row, i, rec)
+                cur_row += 1
+        cur_row += 1  # 빈 행
+
+        # ② AA Total Sales Top 10 — Meta
+        ws.cell(row=cur_row, column=1, value="② AA Total Sales ($) Top 10 — Meta").font = SECTION_FONT
+        cur_row += 1
+        write_header(cur_row)
+        cur_row += 1
+        sales_df = _top_creatives(
             df_all_, d_start_, d_end_,
             country="US", media="Meta", objective="Traffic",
             min_cost=100_000, sort_col="sales_usd", fx_rate=fx_rate_,
             item_filter=[it],
         )
-        if not sales.empty:
-            sales_chunks.append(_format_top(sales))
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        if ctr_chunks:
-            pd.concat(ctr_chunks, ignore_index=True).to_excel(
-                writer, sheet_name="CTR Top10 (TikTok)", index=False)
+        if sales_df.empty:
+            ws.cell(row=cur_row, column=1, value="(해당 소재 없음)").font = SUB_FONT
+            cur_row += 1
         else:
-            pd.DataFrame([{"안내": "조건에 맞는 소재 없음"}]).to_excel(
-                writer, sheet_name="CTR Top10 (TikTok)", index=False)
-        if sales_chunks:
-            pd.concat(sales_chunks, ignore_index=True).to_excel(
-                writer, sheet_name="Sales Top10 (Meta)", index=False)
-        else:
-            pd.DataFrame([{"안내": "조건에 맞는 소재 없음"}]).to_excel(
-                writer, sheet_name="Sales Top10 (Meta)", index=False)
+            for i, rec in enumerate(sales_df.to_dict("records"), start=1):
+                write_data_row(cur_row, i, rec)
+                cur_row += 1
+        cur_row += 2  # 품목 사이 2줄 간격
+
+    ws.freeze_panes = "A4"
+
+    out = io.BytesIO()
+    wb.save(out)
     out.seek(0)
     return out.getvalue()
 
