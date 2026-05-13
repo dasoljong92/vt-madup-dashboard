@@ -131,6 +131,17 @@ def load_data(refresh_key: int = 0) -> pd.DataFrame:
     df = df.dropna(subset=["일별"]).copy()
     df = df[df["국가"].notna()]
 
+    # 시트에 같은 행이 두 줄로 들어가 있는 케이스 제거
+    # (광고 이름, 일별, 매체, 국가, 캠페인 이름, 광고 그룹 이름, 비용, 노출수, 클릭수)
+    # 가 모두 같은 행을 한 번만 합산
+    _dedup_keys = [
+        "광고 이름", "일별", "매체", "국가",
+        "캠페인 이름", "광고 그룹 이름",
+        "비용", "지출 금액(GROSS)", "노출수", "클릭수(목적지)",
+    ]
+    _dedup_keys = [c for c in _dedup_keys if c in df.columns]
+    df = df.drop_duplicates(subset=_dedup_keys, keep="first").copy()
+
     # Numeric conversions (cost = NET, "비용" 컬럼)
     df["cost"] = df["비용"].apply(_parse_num)
     df["cost_gross"] = df["지출 금액(GROSS)"].apply(_parse_num)
