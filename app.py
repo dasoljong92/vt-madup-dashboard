@@ -113,12 +113,15 @@ def _fetch_csv_bytes(url: str, attempts: int = 3) -> bytes:
 
 
 @st.cache_data(show_spinner=False)
-def load_data(refresh_key: int = 0) -> pd.DataFrame:
-    """Load and clean the RD sheet. refresh_key forces cache invalidation."""
+def load_data(refresh_key: int = 0) -> tuple[pd.DataFrame, dict]:
+    """Load and clean the RD sheet. refresh_key forces cache invalidation.
+    Returns (df, meta) where meta has data-quality stats."""
     if LOCAL_CSV.exists() and refresh_key == 0:
         raw = LOCAL_CSV.read_bytes()
+        fetched_from = "local cache"
     else:
         raw = _fetch_csv_bytes(CSV_URL)
+        fetched_from = "Google Sheets"
         try:
             LOCAL_CSV.write_bytes(raw)
         except OSError:
@@ -140,7 +143,9 @@ def load_data(refresh_key: int = 0) -> pd.DataFrame:
         "비용", "지출 금액(GROSS)", "노출수", "클릭수(목적지)",
     ]
     _dedup_keys = [c for c in _dedup_keys if c in df.columns]
+    _before_dedup = len(df)
     df = df.drop_duplicates(subset=_dedup_keys, keep="first").copy()
+    _after_dedup = len(df)
 
     # Numeric conversions (cost = NET, "비용" 컬럼)
     df["cost"] = df["비용"].apply(_parse_num)
@@ -158,7 +163,16 @@ def load_data(refresh_key: int = 0) -> pd.DataFrame:
     df["objective"] = df["캠페인구분"].astype(str).str.strip()
     df["campaign"] = df["캠페인 이름"].astype(str).str.strip()
 
-    return df
+    meta = {
+        "fetched_from": fetched_from,
+        "fetched_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "raw_rows": _before_dedup,
+        "rows_used": _after_dedup,
+        "dup_removed": _before_dedup - _after_dedup,
+        "date_min": df["일별"].min().date() if not df.empty else None,
+        "date_max": df["일별"].max().date() if not df.empty else None,
+    }
+    return df, meta
 
 
 def kpi(df: pd.DataFrame, fx_rate: float) -> dict:
@@ -234,7 +248,7 @@ with st.sidebar:
     )
 
 with st.spinner("데이터를 불러오는 중..."):
-    df_all = load_data(refresh_key=st.session_state.get("refresh_key", 0))
+    df_all, data_meta = load_data(refresh_key=st.session_state.get("refresh_key", 0))
 
 with st.sidebar:
     st.markdown("---")
@@ -304,6 +318,34 @@ with st.sidebar:
     sel_medias = st.multiselect("매체", medias, default=medias)
     sel_items = st.multiselect("품목", items, default=items)
     sel_obj = st.multiselect("캠페인 목적", objectives, default=objectives)
+
+    # ---------- 데이터 품질 체크 패널 ----------
+    with st.expander("🔍 데이터 품질 체크", expanded=False):
+        st.caption(f"📥 소스: **{data_meta['fetched_from']}** · ⏱ {data_meta['fetched_at']}")
+        st.caption(
+            f"raw {data_meta['raw_rows']:,}행 → 사용 {data_meta['rows_used']:,}행 "
+            f"(중복 {data_meta['dup_removed']:,}행 제거)"
+        )
+        st.caption(f"📅 데이터 범위: {data_meta['date_min']} ~ {data_meta['date_max']}")
+        if data_meta["dup_removed"] > 0:
+            st.warning(
+                f"시트에 완전 중복 행 {data_meta['dup_removed']:,}개가 있어 자동 제거했습니다."
+            )
+
+        st.markdown("**월별 NET 지출 합계** (전체 국가·매체·품목 기준)")
+        st.caption("👉 시트의 SUMIFS 결과와 비교해서 같은지 확인할 수 있어요.")
+        monthly = (
+            df_all.assign(_m=df_all["일별"].dt.to_period("M").astype(str))
+            .groupby("_m")["cost"]
+            .agg(["sum", "size"])
+            .rename(columns={"sum": "NET 합계 (₩)", "size": "행 수"})
+            .reset_index()
+            .rename(columns={"_m": "월"})
+        )
+        st.dataframe(
+            monthly.style.format({"NET 합계 (₩)": "₩{:,.0f}", "행 수": "{:,}"}),
+            width="stretch", hide_index=True,
+        )
 
 # Apply filters
 mask = (
