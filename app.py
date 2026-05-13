@@ -254,17 +254,24 @@ with st.sidebar:
     else:
         d_start, d_end = date_min, date_max
 
-    # 비교 기간 (기본: 직전 동일 길이 구간, 사용자 수정 가능)
+    # 비교 기간 (기본: 직전 동일 길이 구간). 메인 기간이 바뀌면 자동 재계산.
     _auto_days = (d_end - d_start).days + 1
     _auto_prev_end = d_start - timedelta(days=1)
     _auto_prev_start = _auto_prev_end - timedelta(days=_auto_days - 1)
     _auto_prev_start = max(_auto_prev_start, date_min)
     _auto_prev_end = max(_auto_prev_end, _auto_prev_start)
+
+    # 메인 기간이 바뀌었으면 비교 기간 위젯 상태를 직전 동일 길이로 강제 리셋
+    _period_token = f"{d_start.isoformat()}_{d_end.isoformat()}"
+    if st.session_state.get("_main_period_token") != _period_token:
+        st.session_state["_main_period_token"] = _period_token
+        st.session_state["cmp_range_widget"] = (_auto_prev_start, _auto_prev_end)
+
     cmp_range = st.date_input(
-        "비교 기간 (기본: 직전 동일 길이)",
-        value=(_auto_prev_start, _auto_prev_end),
+        "비교 기간 (기본: 직전 동일 길이, 메인 기간 변경 시 자동 재계산)",
         min_value=date_min,
         max_value=date_max,
+        key="cmp_range_widget",
         help="KPI 카드 아래 '+/-% vs 직전' 계산에 사용됩니다.",
     )
     if isinstance(cmp_range, (list, tuple)) and len(cmp_range) == 2:
